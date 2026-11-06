@@ -1,0 +1,2115 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS CloudFormation Template for Automated Patching Solution with Step Functions - Supports Install and Scan Modes'
+
+Parameters:
+  EmailAddress:
+    Type: String
+    Description: Email address to receive patching notifications
+    Default: your-email@example.com
+
+  ReportBucketNamePrefix:
+    Type: String
+    Description: >-
+      Prefix for the S3 bucket that stores patch compliance reports. MUST be all lowercase
+      (S3 bucket names cannot contain uppercase letters). The bucket is created as
+      "<prefix>-missing-patches-report" - for example, entering "example-prod" creates the bucket
+      "example-prod-missing-patches-report". Use only lowercase letters, numbers, and hyphens,
+      starting and ending with a letter or number.
+    AllowedPattern: "^[a-z0-9][a-z0-9-]*[a-z0-9]$"
+    ConstraintDescription: "Must be lowercase letters, numbers, and hyphens only, and start and end with a letter or number."
+    MinLength: 2
+    MaxLength: 40
+
+  # Up to 5 PatchGroup tag values. One EventBridge schedule is created per non-blank slot.
+  PatchGroup1:
+    Type: String
+    Default: ""
+    Description: "PatchGroup tag value for schedule slot 1. Leave blank to skip this slot."
+  PatchGroup2:
+    Type: String
+    Default: ""
+    Description: "PatchGroup tag value for schedule slot 2. Leave blank to skip this slot."
+  PatchGroup3:
+    Type: String
+    Default: ""
+    Description: "PatchGroup tag value for schedule slot 3. Leave blank to skip this slot."
+  PatchGroup4:
+    Type: String
+    Default: ""
+    Description: "PatchGroup tag value for schedule slot 4. Leave blank to skip this slot."
+  PatchGroup5:
+    Type: String
+    Default: ""
+    Description: "PatchGroup tag value for schedule slot 5. Leave blank to skip this slot."
+
+Conditions:
+  CreateSchedule1: !Not [!Equals [!Ref PatchGroup1, ""]]
+  CreateSchedule2: !Not [!Equals [!Ref PatchGroup2, ""]]
+  CreateSchedule3: !Not [!Equals [!Ref PatchGroup3, ""]]
+  CreateSchedule4: !Not [!Equals [!Ref PatchGroup4, ""]]
+  CreateSchedule5: !Not [!Equals [!Ref PatchGroup5, ""]]
+
+Resources:
+  # S3 Bucket for Patch Compliance Reports
+  PatchComplianceReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ReportBucketNamePrefix}-missing-patches-report"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # CloudWatch Log Groups (explicit, so retention is enforced at 30 days)
+  StepFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # /aws/vendedlogs/ prefix is required/recommended for Step Functions vended logs
+      LogGroupName: !Sub "/aws/vendedlogs/states/${AWS::StackName}-step-function"
+      RetentionInDays: 30
+
+  CreateAMIFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-create-ami-function"
+      RetentionInDays: 30
+
+  SendNotificationFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-send-notification-function"
+      RetentionInDays: 30
+
+  RunPatchingFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-run-patching-function"
+      RetentionInDays: 30
+
+  RunScanFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-run-scan-function"
+      RetentionInDays: 30
+
+  CheckStatusFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-check-status-function"
+      RetentionInDays: 30
+
+  PatchComplianceReportFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-patch-compliance-report-function"
+      RetentionInDays: 30
+
+  # IAM Roles
+  StepFunctionPatchingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-step-function-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-step-function-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateImage
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstances
+                  - ec2:CreateTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                  - ssm:ListComplianceItems
+                Resource: '*'
+              # SendCommand limited to the patch-baseline document (no arbitrary documents e.g. RunShellScript)
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}::document/AWS-RunPatchBaseline"
+              # ...and only against instances that carry a PatchGroup tag
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringLike:
+                    ssm:resourceTag/PatchGroup: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PatchingAlertsTopic
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt CreateAMIFunction.Arn
+                  - !GetAtt SendNotificationFunction.Arn
+                  - !GetAtt RunPatchingFunction.Arn
+                  - !GetAtt RunScanFunction.Arn
+                  - !GetAtt CheckStatusFunction.Arn
+                  - !GetAtt PatchComplianceReportFunction.Arn
+              # Required for Step Functions CloudWatch Logs delivery (vended logs)
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+
+  LambdaPatchingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-lambda-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:CreateImage
+                  - ec2:CreateTags
+                  - ec2:DescribeImages
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                  - ssm:ListComplianceItems
+                Resource: '*'
+              # SendCommand limited to the patch-baseline document (no arbitrary documents e.g. RunShellScript)
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}::document/AWS-RunPatchBaseline"
+              # ...and only against instances that carry a PatchGroup tag
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringLike:
+                    ssm:resourceTag/PatchGroup: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PatchingAlertsTopic
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "${PatchComplianceReportsBucket.Arn}/*"
+
+  # EventBridge Scheduler Role
+  EventBridgeSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-scheduler-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-scheduler-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref PatchingStepFunction
+
+  # SNS Topic
+  PatchingAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+      DisplayName: !Sub "${AWS::StackName} Alerts"
+      KmsMasterKeyId: alias/aws/sns
+
+  PatchingAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PatchingAlertsTopic
+      Protocol: email
+      Endpoint: !Ref EmailAddress
+
+  # Lambda Functions
+  CreateAMIFunction:
+    DependsOn: CreateAMIFunctionLogGroup
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-create-ami-function"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaPatchingRole.Arn
+      Runtime: python3.14
+      Timeout: 300
+      MemorySize: 128
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import time
+          from datetime import datetime, timezone, timedelta
+
+          def lambda_handler(event, context):
+              # Check if this is a status check operation
+              if event.get('operation') == 'checkStatus':
+                  return check_ami_status(event.get('ami_ids', []))
+              
+              # 'discover' is used by the scan path: find instances WITHOUT creating AMIs
+              operation = event.get('operation', '')
+              
+              # Extract the tag value from the event
+              tag_value = event.get('detail', {}).get('PatchGroup', '')
+              
+              if not tag_value:
+                  return {
+                      'statusCode': 400,
+                      'body': 'No PatchGroup value provided in the event payload',
+                      'instances': [],
+                      'instance_details': [],
+                      'ami_ids': [],
+                      'ami_details': [],
+                      'instancesFound': False
+                  }
+              
+              # Initialize EC2 client
+              ec2 = boto3.client('ec2')
+              
+              # Find instances with the specified tag (paginated to cover large fleets)
+              instance_details = []
+              instance_ids = []
+              paginator = ec2.get_paginator('describe_instances')
+              page_iterator = paginator.paginate(
+                  Filters=[
+                      {
+                          'Name': 'tag:PatchGroup',
+                          'Values': [tag_value]
+                      },
+                      {
+                          'Name': 'instance-state-name',
+                          'Values': ['running']
+                      }
+                  ]
+              )
+              
+              for response in page_iterator:
+                  for reservation in response['Reservations']:
+                      for instance in reservation['Instances']:
+                          instance_id = instance['InstanceId']
+                          instance_ids.append(instance_id)
+                          
+                          # Get instance name from tags
+                          instance_name = instance_id  # Default to ID if no Name tag
+                          for tag in instance.get('Tags', []):
+                              if tag['Key'] == 'Name':
+                                  instance_name = tag['Value']
+                                  break
+                          
+                          instance_details.append({
+                              'id': instance_id,
+                              'name': instance_name
+                          })
+              
+              if not instance_ids:
+                  return {
+                      'statusCode': 200,
+                      'body': 'No instances found with PatchGroup tag value: ' + tag_value,
+                      'instances': [],
+                      'instance_details': [],
+                      'ami_ids': [],
+                      'ami_details': [],
+                      'instancesFound': False,
+                      'patchGroup': tag_value
+                  }
+              
+              # Scan path: return discovered instances without creating any AMIs
+              if operation == 'discover':
+                  return {
+                      'statusCode': 200,
+                      'body': 'Instances discovered for scan (no AMIs created) with PatchGroup tag value: ' + tag_value,
+                      'instances': instance_ids,
+                      'instance_details': instance_details,
+                      'ami_ids': [],
+                      'ami_details': [],
+                      'instancesFound': True,
+                      'patchGroup': tag_value
+                  }
+              
+              # Create AMIs for each instance
+              timestamp = datetime.now(timezone(timedelta(hours=4))).strftime('%Y%m%d-%H%M%S')
+              ami_ids = []
+              ami_details = []
+              
+              for instance in instance_details:
+                  instance_id = instance['id']
+                  instance_name = instance['name']
+                  ami_name = f"{instance_name}-{instance_id}-AMI-BEFORE-PATCHING-{timestamp}"
+                  
+                  # Create AMI with NoReboot option
+                  ami_response = ec2.create_image(
+                      InstanceId=instance_id,
+                      Name=ami_name,
+                      Description=f"Automated AMI created before patching for instance {instance_id} ({instance_name})",
+                      NoReboot=True,
+                      TagSpecifications=[
+                          {
+                              'ResourceType': 'image',
+                              'Tags': [
+                                  {
+                                      'Key': 'Name',
+                                      'Value': ami_name
+                                  },
+                                  {
+                                      'Key': 'PrePatchBackup',
+                                      'Value': 'true'
+                                  },
+                                  {
+                                      'Key': 'CreatedBy',
+                                      'Value': '${AWS::StackName}-step-function'
+                                  },
+                                  {
+                                      'Key': 'PatchGroup',
+                                      'Value': tag_value
+                                  },
+                                  {
+                                      'Key': 'SourceInstanceId',
+                                      'Value': instance_id
+                                  },
+                                  {
+                                      'Key': 'SourceInstanceName',
+                                      'Value': instance_name
+                                  }
+                              ]
+                          },
+                          {
+                              'ResourceType': 'snapshot',
+                              'Tags': [
+                                  {
+                                      'Key': 'Name',
+                                      'Value': ami_name
+                                  },
+                                  {
+                                      'Key': 'PrePatchBackup',
+                                      'Value': 'true'
+                                  },
+                                  {
+                                      'Key': 'CreatedBy',
+                                      'Value': '${AWS::StackName}-step-function'
+                                  },
+                                  {
+                                      'Key': 'PatchGroup',
+                                      'Value': tag_value
+                                  },
+                                  {
+                                      'Key': 'SourceInstanceId',
+                                      'Value': instance_id
+                                  },
+                                  {
+                                      'Key': 'SourceInstanceName',
+                                      'Value': instance_name
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+                  
+                  ami_id = ami_response['ImageId']
+                  ami_ids.append(ami_id)
+                  ami_details.append({
+                      'id': ami_id,
+                      'name': ami_name,
+                      'instance_id': instance_id,
+                      'instance_name': instance_name
+                  })
+              
+              return {
+                  'statusCode': 200,
+                  'body': 'AMI creation initiated for instances with PatchGroup tag value: ' + tag_value,
+                  'instances': instance_ids,
+                  'instance_details': instance_details,
+                  'ami_ids': ami_ids,
+                  'ami_details': ami_details,
+                  'instancesFound': True,
+                  'patchGroup': tag_value
+              }
+              
+          def check_ami_status(ami_ids):
+              if not ami_ids:
+                  return {
+                      'statusCode': 400,
+                      'body': 'No AMI IDs provided',
+                      'allReady': False,
+                      'anyFailed': True,
+                      'amiStatuses': {}
+                  }
+              
+              ec2 = boto3.client('ec2')
+              all_ready = True
+              any_failed = False
+              ami_statuses = {}
+              # AMI states that will never become 'available' -> treat as terminal
+              terminal_states = ['failed', 'error', 'invalid', 'deregistered']
+              
+              for ami_id in ami_ids:
+                  try:
+                      response = ec2.describe_images(ImageIds=[ami_id])
+                      if not response['Images']:
+                          all_ready = False
+                          any_failed = True
+                          ami_statuses[ami_id] = 'NotFound'
+                      else:
+                          state = response['Images'][0]['State']
+                          ami_statuses[ami_id] = state
+                          if state in terminal_states:
+                              all_ready = False
+                              any_failed = True
+                          elif state != 'available':
+                              all_ready = False
+                  except Exception as e:
+                      all_ready = False
+                      any_failed = True
+                      ami_statuses[ami_id] = str(e)
+              
+              return {
+                  'statusCode': 200,
+                  'body': 'AMI status check completed',
+                  'allReady': all_ready,
+                  'anyFailed': any_failed,
+                  'amiStatuses': ami_statuses
+              }
+
+  SendNotificationFunction:
+    DependsOn: SendNotificationFunctionLogGroup
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-send-notification-function"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaPatchingRole.Arn
+      Runtime: python3.14
+      Timeout: 60
+      MemorySize: 128
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          from datetime import datetime, timezone, timedelta
+
+          def lambda_handler(event, context):
+              # Extract information from the event
+              message_type = event.get('messageType', 'INFO')
+              subject = event.get('subject', 'AWS Patching Notification')
+              message = event.get('message', 'No message provided')
+              tag_value = event.get('detail', {}).get('PatchGroup', '')
+              
+              # Get instance and AMI details
+              instance_details = event.get('instance_details', [])
+              if not instance_details and 'instances' in event:
+                  # If we only have instance IDs, try to get details
+                  instance_details = get_instance_details(event.get('instances', []))
+              
+              ami_details = event.get('ami_details', [])
+              if not ami_details and 'createAmiResult' in event:
+                  # Try to get AMI details from createAmiResult if available
+                  ami_details = event.get('createAmiResult', {}).get('ami_details', [])
+                  if not ami_details and 'ami_ids' in event.get('createAmiResult', {}):
+                      ami_ids = event.get('createAmiResult', {}).get('ami_ids', [])
+                      ami_details = get_ami_details(ami_ids)
+              
+              # Check for report URL in scan mode
+              report_url = event.get('reportUrl', None)
+              if not report_url and 'scanResult' in event:
+                  report_url = event.get('scanResult', {}).get('reportUrl', None)
+              report_s3_uri = event.get('reportS3Uri', None)
+              if not report_s3_uri and 'scanResult' in event:
+                  report_s3_uri = event.get('scanResult', {}).get('reportS3Uri', None)
+              
+              # Initialize SNS client
+              sns = boto3.client('sns')
+              
+              # Format current timestamp
+              timestamp = datetime.now(timezone(timedelta(hours=4))).strftime('%Y-%m-%d %H:%M:%S')
+              
+              # Format a more human-readable message
+              formatted_message = (
+                  f"Patching Status Update - {timestamp}\n"
+                  "=======================================\n"
+                  f"Status: {message_type}\n"
+                  f"Message: {message}\n"
+                  f"PatchGroup: {tag_value}\n\n"
+              )
+              
+              # Add instance details
+              if instance_details:
+                  formatted_message += "Affected Instances:\n"
+                  formatted_message += "-------------------\n"
+                  for i, instance in enumerate(instance_details, 1):
+                      if isinstance(instance, dict):
+                          # If we have detailed information
+                          instance_id = instance.get('id', 'Unknown')
+                          instance_name = instance.get('name', 'Unnamed')
+                          formatted_message += f"{i}. {instance_name} ({instance_id})\n"
+                      else:
+                          # If we only have the instance ID
+                          formatted_message += f"{i}. {instance}\n"
+                  formatted_message += "\n"
+              
+              # Add AMI details
+              if ami_details:
+                  formatted_message += "Created AMIs:\n"
+                  formatted_message += "------------\n"
+                  for i, ami in enumerate(ami_details, 1):
+                      if isinstance(ami, dict):
+                          # If we have detailed information
+                          ami_id = ami.get('id', 'Unknown')
+                          ami_name = ami.get('name', 'Unnamed')
+                          instance_id = ami.get('instance_id', 'Unknown')
+                          instance_name = ami.get('instance_name', 'Unknown')
+                          formatted_message += f"{i}. {ami_name} ({ami_id}) - Created from {instance_name} ({instance_id})\n"
+                      else:
+                          # If we only have the AMI ID
+                          formatted_message += f"{i}. {ami}\n"
+                  formatted_message += "\n"
+              
+              # Add report location if available
+              if report_url:
+                  formatted_message += "Patch Compliance Report:\n"
+                  formatted_message += "------------------------\n"
+                  if report_s3_uri:
+                      formatted_message += f"File: {report_s3_uri}\n"
+                  formatted_message += "Open in the S3 console (sign-in required):\n"
+                  formatted_message += f"{report_url}\n\n"
+              
+              # Add footer
+              formatted_message += f"This is an automated message from the ${AWS::StackName} patching solution."
+              
+              # Publish message to SNS topic using the proper ARN reference
+              response = sns.publish(
+                  TopicArn="${PatchingAlertsTopic}",
+                  Message=formatted_message,
+                  Subject=subject
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': 'Notification sent successfully',
+                  'messageId': response['MessageId']
+              }
+              
+          def get_instance_details(instance_ids):
+              if not instance_ids:
+                  return []
+              
+              ec2 = boto3.client('ec2')
+              instance_details = []
+              
+              try:
+                  # Get instance details (paginated)
+                  paginator = ec2.get_paginator('describe_instances')
+                  
+                  for response in paginator.paginate(InstanceIds=instance_ids):
+                      for reservation in response['Reservations']:
+                          for instance in reservation['Instances']:
+                              instance_id = instance['InstanceId']
+                              
+                              # Get instance name from tags
+                              instance_name = instance_id  # Default to ID if no Name tag
+                              for tag in instance.get('Tags', []):
+                                  if tag['Key'] == 'Name':
+                                      instance_name = tag['Value']
+                                      break
+                              
+                              instance_details.append({
+                                  'id': instance_id,
+                                  'name': instance_name
+                              })
+              except Exception as e:
+                  # If we can't get details, just return the IDs
+                  return [{'id': id, 'name': id} for id in instance_ids]
+                  
+              return instance_details
+          
+          def get_ami_details(ami_ids):
+              if not ami_ids:
+                  return []
+              
+              ec2 = boto3.client('ec2')
+              ami_details = []
+              
+              try:
+                  # Get AMI details (paginated)
+                  paginator = ec2.get_paginator('describe_images')
+                  
+                  for response in paginator.paginate(ImageIds=ami_ids):
+                      for image in response['Images']:
+                          ami_id = image['ImageId']
+                          ami_name = image.get('Name', ami_id)
+                          
+                          # Get source instance ID and name from tags
+                          instance_id = 'Unknown'
+                          instance_name = 'Unknown'
+                          for tag in image.get('Tags', []):
+                              if tag['Key'] == 'SourceInstanceId':
+                                  instance_id = tag['Value']
+                              elif tag['Key'] == 'SourceInstanceName':
+                                  instance_name = tag['Value']
+                          
+                          ami_details.append({
+                              'id': ami_id,
+                              'name': ami_name,
+                              'instance_id': instance_id,
+                              'instance_name': instance_name
+                          })
+              except Exception as e:
+                  # If we can't get details, just return the IDs
+                  return [{'id': id, 'name': id} for id in ami_ids]
+                  
+              return ami_details
+
+  RunPatchingFunction:
+    DependsOn: RunPatchingFunctionLogGroup
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-run-patching-function"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaPatchingRole.Arn
+      Runtime: python3.14
+      Timeout: 300
+      MemorySize: 128
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import time
+
+          def lambda_handler(event, context):
+              # Extract information from the event
+              tag_value = event.get('detail', {}).get('PatchGroup', '')
+              instances = event.get('instances', [])
+              instance_details = event.get('instance_details', [])
+              
+              if not tag_value and not instances:
+                  return {
+                      'statusCode': 400,
+                      'body': 'No PatchGroup value or instances provided in the event payload',
+                      'instances': [],
+                      'instance_details': [],
+                      'commandId': None
+                  }
+              
+              if not instances:
+                  # If no instances provided, find instances with the specified tag (paginated)
+                  ec2 = boto3.client('ec2')
+                  instance_details = []
+                  paginator = ec2.get_paginator('describe_instances')
+                  page_iterator = paginator.paginate(
+                      Filters=[
+                          {
+                              'Name': 'tag:PatchGroup',
+                              'Values': [tag_value]
+                          },
+                          {
+                              'Name': 'instance-state-name',
+                              'Values': ['running']
+                          }
+                      ]
+                  )
+                  
+                  for response in page_iterator:
+                      for reservation in response['Reservations']:
+                          for instance in reservation['Instances']:
+                              instance_id = instance['InstanceId']
+                              instances.append(instance_id)
+                              
+                              # Get instance name from tags
+                              instance_name = instance_id  # Default to ID if no Name tag
+                              for tag in instance.get('Tags', []):
+                                  if tag['Key'] == 'Name':
+                                      instance_name = tag['Value']
+                                      break
+                              
+                              instance_details.append({
+                                  'id': instance_id,
+                                  'name': instance_name
+                              })
+              
+              if not instances:
+                  return {
+                      'statusCode': 200,
+                      'body': 'No instances found with PatchGroup tag value: ' + tag_value,
+                      'instances': [],
+                      'instance_details': [],
+                      'commandId': None
+                  }
+              
+              # Initialize SSM client
+              ssm = boto3.client('ssm')
+              
+              # Run AWS-RunPatchBaseline using tag Targets so the command is not
+              # capped at the 50-instance limit that applies to an explicit InstanceIds list
+              response = ssm.send_command(
+                  Targets=[
+                      {
+                          'Key': 'tag:PatchGroup',
+                          'Values': [tag_value]
+                      }
+                  ],
+                  DocumentName='AWS-RunPatchBaseline',
+                  Parameters={
+                      'Operation': ['Install'],
+                      'RebootOption': ['RebootIfNeeded']
+                  },
+                  TimeoutSeconds=3600,
+                  Comment=f'Patching PatchGroup={tag_value} via ${AWS::StackName}'
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': 'Patching command sent successfully',
+                  'instances': instances,
+                  'instance_details': instance_details,
+                  'commandId': response['Command']['CommandId']
+              }
+
+  RunScanFunction:
+    DependsOn: RunScanFunctionLogGroup
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-run-scan-function"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaPatchingRole.Arn
+      Runtime: python3.14
+      Timeout: 300
+      MemorySize: 128
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import time
+
+          def lambda_handler(event, context):
+              # Extract information from the event
+              tag_value = event.get('detail', {}).get('PatchGroup', '')
+              instances = event.get('instances', [])
+              instance_details = event.get('instance_details', [])
+              
+              if not tag_value and not instances:
+                  return {
+                      'statusCode': 400,
+                      'body': 'No PatchGroup value or instances provided in the event payload',
+                      'instances': [],
+                      'instance_details': [],
+                      'commandId': None
+                  }
+              
+              if not instances:
+                  # If no instances provided, find instances with the specified tag (paginated)
+                  ec2 = boto3.client('ec2')
+                  instance_details = []
+                  paginator = ec2.get_paginator('describe_instances')
+                  page_iterator = paginator.paginate(
+                      Filters=[
+                          {
+                              'Name': 'tag:PatchGroup',
+                              'Values': [tag_value]
+                          },
+                          {
+                              'Name': 'instance-state-name',
+                              'Values': ['running']
+                          }
+                      ]
+                  )
+                  
+                  for response in page_iterator:
+                      for reservation in response['Reservations']:
+                          for instance in reservation['Instances']:
+                              instance_id = instance['InstanceId']
+                              instances.append(instance_id)
+                              
+                              # Get instance name from tags
+                              instance_name = instance_id  # Default to ID if no Name tag
+                              for tag in instance.get('Tags', []):
+                                  if tag['Key'] == 'Name':
+                                      instance_name = tag['Value']
+                                      break
+                              
+                              instance_details.append({
+                                  'id': instance_id,
+                                  'name': instance_name
+                              })
+              
+              if not instances:
+                  return {
+                      'statusCode': 200,
+                      'body': 'No instances found with PatchGroup tag value: ' + tag_value,
+                      'instances': [],
+                      'instance_details': [],
+                      'commandId': None
+                  }
+              
+              # Initialize SSM client
+              ssm = boto3.client('ssm')
+              
+              # Run AWS-RunPatchBaseline in scan mode using tag Targets so the command is not
+              # capped at the 50-instance limit that applies to an explicit InstanceIds list
+              response = ssm.send_command(
+                  Targets=[
+                      {
+                          'Key': 'tag:PatchGroup',
+                          'Values': [tag_value]
+                      }
+                  ],
+                  DocumentName='AWS-RunPatchBaseline',
+                  Parameters={
+                      'Operation': ['Scan'],
+                      'RebootOption': ['NoReboot']
+                  },
+                  TimeoutSeconds=3600,
+                  Comment=f'Scanning PatchGroup={tag_value} via ${AWS::StackName}'
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': 'Scan command sent successfully',
+                  'instances': instances,
+                  'instance_details': instance_details,
+                  'commandId': response['Command']['CommandId'],
+                  'patchGroup': tag_value
+              }
+
+  CheckStatusFunction:
+    DependsOn: CheckStatusFunctionLogGroup
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-check-status-function"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaPatchingRole.Arn
+      Runtime: python3.14
+      Timeout: 300
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import time
+
+          def lambda_handler(event, context):
+              # Extract information from the event
+              command_id = event.get('commandId')
+              instances = event.get('instances', [])
+              instance_details = event.get('instance_details', [])
+              patch_group = event.get('patchGroup', '')
+              
+              if not command_id or not instances:
+                  return {
+                      'statusCode': 400,
+                      'body': 'Missing required parameters: commandId and instances',
+                      'status': 'FAILED',
+                      'details': 'Invalid input parameters'
+                  }
+              
+              # Initialize SSM client
+              ssm = boto3.client('ssm')
+              
+              # Check the status of the command for each instance
+              all_success = True
+              failed_instances = []
+              status_details = {}
+              
+              for instance_id in instances:
+                  try:
+                      # Get command invocation status
+                      response = ssm.get_command_invocation(
+                          CommandId=command_id,
+                          InstanceId=instance_id
+                      )
+                      
+                      status = response['Status']
+                      status_details[instance_id] = {
+                          'status': status,
+                          'statusDetails': response.get('StatusDetails', ''),
+                          'standardOutputContent': response.get('StandardOutputContent', '')[:500]  # Truncate for brevity
+                      }
+                      
+                      # Check if the command failed or was canceled
+                      if status in ['Failed', 'Cancelled', 'TimedOut', 'Cancelling']:
+                          all_success = False
+                          failed_instances.append(instance_id)
+                      # Check if the command is still in progress
+                      elif status in ['Pending', 'InProgress', 'Delayed']:
+                          all_success = False
+                          
+                  except ssm.exceptions.InvocationDoesNotExist:
+                      # Right after send_command the invocation may not be registered
+                      # yet (eventual consistency). Treat as in-progress so the state
+                      # machine re-polls instead of declaring a false failure.
+                      status_details[instance_id] = {
+                          'status': 'InProgress',
+                          'statusDetails': 'Command invocation not yet registered',
+                          'note': 'InvocationDoesNotExist - retrying'
+                      }
+                      all_success = False
+              
+              # Determine overall status
+              overall_status = 'SUCCESS' if all_success else 'FAILED'
+              
+              # If any instance is still in progress, return INPROGRESS status
+              for instance_id, details in status_details.items():
+                  if details.get('status') in ['Pending', 'InProgress', 'Delayed']:
+                      overall_status = 'INPROGRESS'
+                      break
+              
+              return {
+                  'statusCode': 200,
+                  'body': f'Command status: {overall_status}',
+                  'status': overall_status,
+                  'failedInstances': failed_instances,
+                  'details': status_details,
+                  'instances': instances,
+                  'instance_details': instance_details,
+                  'patchGroup': patch_group,
+                  'commandId': command_id
+              }
+
+  PatchComplianceReportFunction:
+    DependsOn: PatchComplianceReportFunctionLogGroup
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-patch-compliance-report-function"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaPatchingRole.Arn
+      Runtime: python3.14
+      Timeout: 180  # 3 minutes as specified
+      MemorySize: 128  # 128MB as specified
+      Environment:
+        Variables:
+          REPORT_BUCKET: !Ref PatchComplianceReportsBucket
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import time
+          import concurrent.futures
+          from datetime import datetime, timezone, timedelta
+          from botocore.exceptions import ClientError
+
+          def lambda_handler(event, context):
+              """
+              AWS Lambda function to collect patch compliance data for EC2 instances with a specific PatchGroup tag,
+              format the results, and upload to S3.
+              
+              Parameters:
+              - event: Lambda event data, should contain 'patchGroup' key
+              - context: Lambda context
+              
+              Returns:
+              - Dictionary with execution results
+              """
+              # Get the PatchGroup value from the event
+              patch_group = event.get('patchGroup', '')
+              if not patch_group and 'detail' in event:
+                  patch_group = event.get('detail', {}).get('PatchGroup', '')
+              
+              # S3 bucket for storing results (sourced from the bucket resource via env var)
+              s3_bucket = os.environ['REPORT_BUCKET']
+              
+              print(f"Starting patch compliance report for PatchGroup: {patch_group}")
+              start_time = time.time()
+              
+              # Initialize AWS clients
+              ssm_client = boto3.client('ssm')
+              ec2_client = boto3.client('ec2')
+              s3_client = boto3.client('s3')
+              
+              # Get instances with the specified PatchGroup tag
+              instances = []
+              
+              # If instances are provided in the event, use them
+              if 'instances' in event and event['instances']:
+                  instance_ids = event['instances']
+                  instance_details = event.get('instance_details', [])
+                  
+                  # If we have instance details, use them
+                  if instance_details:
+                      instances = instance_details
+                  else:
+                      # Otherwise, get instance details from EC2 (paginated)
+                      try:
+                          paginator = ec2_client.get_paginator('describe_instances')
+                          for response in paginator.paginate(InstanceIds=instance_ids):
+                              for reservation in response['Reservations']:
+                                  for instance in reservation['Instances']:
+                                      instance_id = instance['InstanceId']
+                                      
+                                      # Get instance name from tags
+                                      instance_name = instance_id  # Default to ID if no Name tag
+                                      for tag in instance.get('Tags', []):
+                                          if tag['Key'] == 'Name':
+                                              instance_name = tag['Value']
+                                              break
+                                      
+                                      instances.append({
+                                          'id': instance_id,
+                                          'name': instance_name
+                                      })
+                      except Exception as e:
+                          print(f"Error getting instance details: {e}")
+                          # If we can't get details, just use the IDs
+                          instances = [{'id': id, 'name': id} for id in instance_ids]
+              else:
+                  # Otherwise, find instances with the specified tag (paginated)
+                  try:
+                      paginator = ec2_client.get_paginator('describe_instances')
+                      page_iterator = paginator.paginate(
+                          Filters=[
+                              {
+                                  'Name': 'tag:PatchGroup',
+                                  'Values': [patch_group]
+                              },
+                              {
+                                  'Name': 'instance-state-name',
+                                  'Values': ['running']
+                              }
+                          ]
+                      )
+                      
+                      for response in page_iterator:
+                          for reservation in response['Reservations']:
+                              for instance in reservation['Instances']:
+                                  instance_id = instance['InstanceId']
+                                  
+                                  # Get instance name from tags
+                                  instance_name = instance_id  # Default to ID if no Name tag
+                                  for tag in instance.get('Tags', []):
+                                      if tag['Key'] == 'Name':
+                                          instance_name = tag['Value']
+                                          break
+                                  
+                                  instances.append({
+                                      'id': instance_id,
+                                      'name': instance_name
+                                  })
+                  except Exception as e:
+                      print(f"Error finding instances with PatchGroup tag: {e}")
+              
+              if not instances:
+                  print(f"No instances found with PatchGroup tag value: {patch_group}")
+                  return {
+                      'statusCode': 200,
+                      'body': f'No instances found with PatchGroup tag value: {patch_group}',
+                      'instances': [],
+                      'instance_details': [],
+                      'reportUrl': None
+                  }
+              
+              print(f"Found {len(instances)} instances with PatchGroup tag value: {patch_group}")
+              
+              # Collect compliance data for each instance
+              compliance_data = {}
+              
+              with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                  # Create a future for each instance
+                  future_to_instance = {
+                      executor.submit(get_instance_compliance, ssm_client, instance): instance
+                      for instance in instances
+                  }
+                  
+                  # Process results as they complete
+                  for future in concurrent.futures.as_completed(future_to_instance):
+                      instance = future_to_instance[future]
+                      try:
+                          result = future.result()
+                          compliance_data[instance['id']] = {
+                              'instance_id': instance['id'],
+                              'instance_name': instance['name'],
+                              'missing_patches': result
+                          }
+                      except Exception as e:
+                          print(f"Error processing instance {instance['id']}: {e}")
+                          compliance_data[instance['id']] = {
+                              'instance_id': instance['id'],
+                              'instance_name': instance['name'],
+                              'missing_patches': [],
+                              'error': str(e)
+                          }
+              
+              # Format the results
+              report_text = format_compliance_results(compliance_data)
+              
+              # Generate a timestamp for the report filename
+              timestamp = datetime.now(timezone(timedelta(hours=4))).strftime('%Y%m%d-%H%M%S')
+              report_key = f"reports/{patch_group}/{patch_group}-patch-compliance-report-{timestamp}.txt"
+              
+              # Upload the report to S3
+              try:
+                  from urllib.parse import quote
+                  region = os.environ['AWS_REGION']
+                  
+                  s3_client.put_object(
+                      Bucket=s3_bucket,
+                      Key=report_key,
+                      Body=report_text,
+                      ContentType='text/plain'
+                  )
+                  
+                  # Also upload a "latest" version of the report
+                  latest_key = f"reports/{patch_group}/{patch_group}-latest-patch-compliance-report.txt"
+                  s3_client.put_object(
+                      Bucket=s3_bucket,
+                      Key=latest_key,
+                      Body=report_text,
+                      ContentType='text/plain'
+                  )
+                  
+                  # Build an S3 console link to the report. This is NOT a pre-signed URL:
+                  # the object stays private and the recipient must be signed in to the
+                  # account (with s3:GetObject) to open it.
+                  report_url = (
+                      f"https://{region}.console.aws.amazon.com/s3/object/"
+                      f"{s3_bucket}?region={region}&prefix={quote(report_key)}"
+                  )
+                  report_s3_uri = f"s3://{s3_bucket}/{report_key}"
+                  
+                  print(f"Report uploaded to S3: s3://{s3_bucket}/{report_key}")
+                  print(f"Latest report: s3://{s3_bucket}/{latest_key}")
+                  print(f"Console URL: {report_url}")
+                  
+              except Exception as e:
+                  print(f"Error uploading report to S3: {e}")
+                  report_url = None
+                  report_s3_uri = None
+              
+              end_time = time.time()
+              print(f"Patch compliance report completed in {end_time - start_time:.2f} seconds")
+              
+              return {
+                  'statusCode': 200,
+                  'body': 'Patch compliance report generated successfully',
+                  'instances': [instance['id'] for instance in instances],
+                  'instance_details': instances,
+                  'reportUrl': report_url,
+                  'reportS3Uri': report_s3_uri,
+                  'patchGroup': patch_group
+              }
+              
+          def get_instance_compliance(ssm_client, instance):
+              """
+              Get patch compliance data for a single instance.
+              
+              Parameters:
+              - ssm_client: boto3 SSM client
+              - instance: Dictionary with instance information
+              
+              Returns:
+              - List of missing patches
+              """
+              try:
+                  # Get missing patches for the instance (paginated so the report
+                  # is not truncated for instances with many missing patches)
+                  paginator = ssm_client.get_paginator('list_compliance_items')
+                  page_iterator = paginator.paginate(
+                      Filters=[
+                          {
+                              'Key': 'ComplianceType',
+                              'Values': ['Patch']
+                          },
+                          {
+                              'Key': 'Status',
+                              'Values': ['NON_COMPLIANT']
+                          }
+                      ],
+                      ResourceIds=[instance['id']]
+                  )
+                  
+                  # Extract patch details
+                  missing_patches = []
+                  for response in page_iterator:
+                      for item in response.get('ComplianceItems', []):
+                          patch_info = {
+                              'title': item.get('Title', 'Unknown'),
+                              'severity': item.get('Severity', 'Unknown'),
+                              'status': item.get('Status', 'Unknown'),
+                              'id': item.get('Id', 'Unknown'),
+                              'classification': item.get('Classification', 'Unknown')
+                          }
+                          
+                          # Extract additional details from the Details field if available
+                          details = item.get('Details', {})
+                          if 'CVEIds' in details:
+                              patch_info['cve_ids'] = details['CVEIds']
+                          
+                          missing_patches.append(patch_info)
+                  
+                  return missing_patches
+              
+              except ClientError as e:
+                  print(f"Error getting compliance data for instance {instance['id']}: {e}")
+                  raise
+
+          def format_compliance_results(compliance_data):
+              """
+              Format compliance data into a readable text report.
+              
+              Parameters:
+              - compliance_data: Dictionary mapping instance IDs to compliance data
+              
+              Returns:
+              - Formatted string with compliance results
+              """
+              lines = []
+              
+              # Add report header
+              lines.append("=" * 100)
+              lines.append(f"PATCH COMPLIANCE REPORT - {datetime.now(timezone(timedelta(hours=4))).strftime('%Y-%m-%d %H:%M:%S')}")
+              lines.append("=" * 100)
+              lines.append("")
+              
+              # Summary section
+              total_instances = len(compliance_data)
+              instances_with_missing_patches = sum(1 for data in compliance_data.values() if data['missing_patches'])
+              total_missing_patches = sum(len(data['missing_patches']) for data in compliance_data.values())
+              
+              lines.append("SUMMARY")
+              lines.append("-" * 100)
+              lines.append(f"Total instances scanned: {total_instances}")
+              lines.append(f"Instances with missing patches: {instances_with_missing_patches}")
+              lines.append(f"Total missing patches: {total_missing_patches}")
+              lines.append("")
+              
+              # Detailed results for each instance
+              lines.append("DETAILED RESULTS")
+              lines.append("-" * 100)
+              
+              # Sort instances by number of missing patches (descending)
+              sorted_instances = sorted(
+                  compliance_data.values(),
+                  key=lambda x: len(x['missing_patches']),
+                  reverse=True
+              )
+              
+              for instance_data in sorted_instances:
+                  instance_id = instance_data['instance_id']
+                  instance_name = instance_data['instance_name']
+                  missing_patches = instance_data['missing_patches']
+                  
+                  lines.append(f"Instance: {instance_name} ({instance_id})")
+                  
+                  if 'error' in instance_data:
+                      lines.append(f"  Error: {instance_data['error']}")
+                      lines.append("")
+                      continue
+                  
+                  if not missing_patches:
+                      lines.append("  No missing patches found.")
+                      lines.append("")
+                      continue
+                  
+                  lines.append(f"  Missing patches: {len(missing_patches)}")
+                  
+                  # Table header for patches
+                  lines.append("  " + "-" * 96)
+                  
+                  # Sort patches by severity (Critical first, then High, etc.)
+                  severity_order = {"Critical": 0, "Important": 1, "High": 2, "Medium": 3, "Low": 4, "Unknown": 5, "UNSPECIFIED": 6}
+                  sorted_patches = sorted(
+                      missing_patches,
+                      key=lambda x: severity_order.get(x.get('severity', 'Unknown'), 999)
+                  )
+                  
+                  # First, display a summary table with severity and classification
+                  lines.append("  {:<15} {:<15} {:<65}".format("Severity", "Classification", "Patch Title"))
+                  lines.append("  " + "-" * 96)
+                  
+                  for patch in sorted_patches:
+                      title = patch.get('title', 'Unknown')
+                      severity = patch.get('severity', 'Unknown')
+                      classification = patch.get('classification', 'Unknown')
+                      
+                      # Handle multi-line titles by wrapping text
+                      if len(title) > 65:
+                          # First line with severity and classification
+                          lines.append("  {:<15} {:<15} {:<65}".format(severity, classification, title[:65]))
+                          
+                          # Additional lines for the rest of the title
+                          remaining_title = title[65:]
+                          while remaining_title:
+                              chunk = remaining_title[:65]
+                              remaining_title = remaining_title[65:]
+                              lines.append("  {:<15} {:<15} {:<65}".format("", "", chunk))
+                      else:
+                          lines.append("  {:<15} {:<15} {:<65}".format(severity, classification, title))
+                  
+                  # Add CVE IDs if available
+                  cve_patches = [p for p in missing_patches if 'cve_ids' in p]
+                  if cve_patches:
+                      lines.append("")
+                      lines.append("  CVE References:")
+                      lines.append("  " + "-" * 96)
+                      for patch in cve_patches:
+                          title = patch.get('title', 'Unknown')
+                          cve_ids = patch.get('cve_ids', '').split(',')
+                          
+                          # Display full title with CVE IDs
+                          lines.append(f"  - {title}")
+                          lines.append(f"    CVEs: {', '.join(cve_ids)}")
+                  
+                  lines.append("")
+                  lines.append("  " + "-" * 96)
+                  lines.append("")
+              
+              return "\n".join(lines)
+
+  # Step Function
+  PatchingStepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AWS::StackName}-step-function"
+      RoleArn: !GetAtt StepFunctionPatchingRole.Arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionLogGroup.Arn
+      Definition:
+        Comment: !Sub "AWS Step Function for automated patching of instances with dynamic PatchGroup tag for ${AWS::StackName}"
+        # Hard cap on total execution time so a stuck polling loop (e.g. an instance
+        # that never registers an SSM invocation) cannot run for the 1-year service max.
+        TimeoutSeconds: 21600
+        StartAt: DeterminePatchMode
+        States:
+          DeterminePatchMode:
+            Type: Choice
+            Choices:
+              - Variable: $.detail.PatchMode
+                StringEquals: scan
+                Next: GetInstancesForScan
+            Default: CreateAMIs
+          
+          # Install Mode Path (Original Flow)
+          CreateAMIs:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.errorInfo
+                Next: SendExecutionFailedNotification
+            Resource: !GetAtt CreateAMIFunction.Arn
+            ResultPath: $.createAmiResult
+            Next: CheckInstancesFound
+          
+          CheckInstancesFound:
+            Type: Choice
+            Choices:
+              - Variable: $.createAmiResult.instancesFound
+                BooleanEquals: true
+                Next: CheckAMIStatus
+            Default: SendNoInstancesNotification
+          
+          SendNoInstancesNotification:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Resource: !GetAtt SendNotificationFunction.Arn
+            Parameters:
+              messageType: INFO
+              subject: !Sub "${AWS::StackName} - No Instances Found for Patch"
+              message: "No instances found with the specified PatchGroup tag value. Patching process will not continue."
+              detail:
+                PatchGroup.$: $.detail.PatchGroup
+              createAmiResult.$: $.createAmiResult
+            ResultPath: $.notificationResult
+            End: true
+          
+          # Using Lambda invoke pattern for AMI status check
+          CheckAMIStatus:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.errorInfo
+                Next: SendExecutionFailedNotification
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: !GetAtt CreateAMIFunction.Arn
+              Payload:
+                operation: checkStatus
+                ami_ids.$: $.createAmiResult.ami_ids
+            ResultPath: $.amiStatusResult
+            Next: AreAMIsReady
+          
+          AreAMIsReady:
+            Type: Choice
+            Choices:
+              - Variable: $.amiStatusResult.Payload.anyFailed
+                BooleanEquals: true
+                Next: SendAMIFailureNotification
+              - Variable: $.amiStatusResult.Payload.allReady
+                BooleanEquals: true
+                Next: SendPrePatchingNotification
+            Default: WaitForAMIs
+          
+          # Back off between AMI status polls instead of a tight loop
+          WaitForAMIs:
+            Type: Wait
+            Seconds: 30
+            Next: CheckAMIStatus
+          
+          # Terminal state when a pre-patching AMI enters a failed state
+          SendAMIFailureNotification:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Resource: !GetAtt SendNotificationFunction.Arn
+            Parameters:
+              messageType: ERROR
+              subject: !Sub "${AWS::StackName} - AMI Creation Failed"
+              message: "One or more pre-patching AMIs entered a failed state. Patching has been aborted to protect the instances. Review the AMIs and source instances before retrying."
+              detail:
+                PatchGroup.$: $.detail.PatchGroup
+              instances.$: $.createAmiResult.instances
+              instance_details.$: $.createAmiResult.instance_details
+              createAmiResult.$: $.createAmiResult
+            ResultPath: $.finalNotificationResult
+            End: true
+          
+          SendPrePatchingNotification:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Resource: !GetAtt SendNotificationFunction.Arn
+            Parameters:
+              messageType: INFO
+              subject: !Sub "${AWS::StackName} - AMIs Created Successfully"
+              message: "AMIs have been successfully created for all instances with the specified PatchGroup tag. Patching process will begin shortly."
+              detail:
+                PatchGroup.$: $.detail.PatchGroup
+              instances.$: $.createAmiResult.instances
+              instance_details.$: $.createAmiResult.instance_details
+              ami_details.$: $.createAmiResult.ami_details
+              createAmiResult.$: $.createAmiResult
+            ResultPath: $.notificationResult
+            Next: RunPatching
+          
+          # Using Lambda to initiate SSM command
+          RunPatching:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.errorInfo
+                Next: SendExecutionFailedNotification
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: !GetAtt RunPatchingFunction.Arn
+              Payload:
+                detail:
+                  PatchGroup.$: $.detail.PatchGroup
+                instances.$: $.createAmiResult.instances
+                instance_details.$: $.createAmiResult.instance_details
+            ResultPath: $.patchingResult
+            Next: WaitBeforeCheckingStatus
+          
+          # Add a short wait before checking status to allow command to start
+          WaitBeforeCheckingStatus:
+            Type: Wait
+            Seconds: 10
+            Next: CheckPatchingStatus
+          
+          # Using Lambda to check SSM command status
+          CheckPatchingStatus:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.errorInfo
+                Next: SendExecutionFailedNotification
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: !GetAtt CheckStatusFunction.Arn
+              Payload:
+                commandId.$: $.patchingResult.Payload.commandId
+                instances.$: $.patchingResult.Payload.instances
+                instance_details.$: $.patchingResult.Payload.instance_details
+            ResultPath: $.statusResult
+            Next: IsPatchingComplete
+          
+          IsPatchingComplete:
+            Type: Choice
+            Choices:
+              - Variable: $.statusResult.Payload.status
+                StringEquals: SUCCESS
+                Next: SendSuccessNotification
+              - Variable: $.statusResult.Payload.status
+                StringEquals: FAILED
+                Next: SendFailureNotification
+              # Add a new condition for INPROGRESS status
+              - Variable: $.statusResult.Payload.status
+                StringEquals: INPROGRESS
+                Next: WaitForPatchingToComplete
+            Default: CheckPatchingStatus
+          
+          # Add a wait state before checking status again
+          WaitForPatchingToComplete:
+            Type: Wait
+            Seconds: 60
+            Next: CheckPatchingStatus
+          
+          SendSuccessNotification:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Resource: !GetAtt SendNotificationFunction.Arn
+            Parameters:
+              messageType: SUCCESS
+              subject: !Sub "${AWS::StackName} - Patching Completed Successfully"
+              message: "Patching has been successfully completed for all instances with the specified PatchGroup tag."
+              detail:
+                PatchGroup.$: $.detail.PatchGroup
+              instances.$: $.patchingResult.Payload.instances
+              instance_details.$: $.patchingResult.Payload.instance_details
+              statusResult.$: $.statusResult.Payload
+              createAmiResult.$: $.createAmiResult
+            ResultPath: $.finalNotificationResult
+            End: true
+          
+          SendFailureNotification:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Resource: !GetAtt SendNotificationFunction.Arn
+            Parameters:
+              messageType: ERROR
+              subject: !Sub "${AWS::StackName} - Patching Failed"
+              message: "Patching has failed for one or more instances with the specified PatchGroup tag. Please check the details for more information."
+              detail:
+                PatchGroup.$: $.detail.PatchGroup
+              instances.$: $.patchingResult.Payload.instances
+              instance_details.$: $.patchingResult.Payload.instance_details
+              statusResult.$: $.statusResult.Payload
+              createAmiResult.$: $.createAmiResult
+            ResultPath: $.finalNotificationResult
+            End: true
+          
+          # Scan Mode Path
+          GetInstancesForScan:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.errorInfo
+                Next: SendExecutionFailedNotification
+            Resource: !GetAtt CreateAMIFunction.Arn
+            Parameters:
+              operation: discover
+              detail:
+                PatchGroup.$: $.detail.PatchGroup
+            ResultPath: $.createAmiResult
+            Next: CheckScanInstancesFound
+          
+          CheckScanInstancesFound:
+            Type: Choice
+            Choices:
+              - Variable: $.createAmiResult.instancesFound
+                BooleanEquals: true
+                Next: RunScan
+            Default: SendNoScanInstancesNotification
+          
+          SendNoScanInstancesNotification:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Resource: !GetAtt SendNotificationFunction.Arn
+            Parameters:
+              messageType: INFO
+              subject: !Sub "${AWS::StackName} - No Instances Found for Scan"
+              message: "No instances found with the specified PatchGroup tag value. Scan process will not continue."
+              detail:
+                PatchGroup.$: $.detail.PatchGroup
+              createAmiResult.$: $.createAmiResult
+            ResultPath: $.notificationResult
+            End: true
+          
+          # Using Lambda to initiate SSM scan command
+          RunScan:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.errorInfo
+                Next: SendExecutionFailedNotification
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: !GetAtt RunScanFunction.Arn
+              Payload:
+                detail:
+                  PatchGroup.$: $.detail.PatchGroup
+                instances.$: $.createAmiResult.instances
+                instance_details.$: $.createAmiResult.instance_details
+            ResultPath: $.scanResult
+            Next: WaitBeforeCheckingScanStatus
+          
+          # Add a short wait before checking status to allow command to start
+          WaitBeforeCheckingScanStatus:
+            Type: Wait
+            Seconds: 10
+            Next: CheckScanStatus
+          
+          # Using Lambda to check SSM command status
+          CheckScanStatus:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.errorInfo
+                Next: SendExecutionFailedNotification
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: !GetAtt CheckStatusFunction.Arn
+              Payload:
+                commandId.$: $.scanResult.Payload.commandId
+                instances.$: $.scanResult.Payload.instances
+                instance_details.$: $.scanResult.Payload.instance_details
+                patchGroup.$: $.scanResult.Payload.patchGroup
+            ResultPath: $.statusResult
+            Next: IsScanComplete
+          
+          IsScanComplete:
+            Type: Choice
+            Choices:
+              - Variable: $.statusResult.Payload.status
+                StringEquals: SUCCESS
+                Next: GeneratePatchReport
+              - Variable: $.statusResult.Payload.status
+                StringEquals: FAILED
+                Next: SendScanFailureNotification
+              # Add a new condition for INPROGRESS status
+              - Variable: $.statusResult.Payload.status
+                StringEquals: INPROGRESS
+                Next: WaitForScanToComplete
+            Default: CheckScanStatus
+          
+          # Add a wait state before checking scan status again
+          WaitForScanToComplete:
+            Type: Wait
+            Seconds: 60
+            Next: CheckScanStatus
+          
+          # Using Lambda to generate patch report
+          GeneratePatchReport:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.errorInfo
+                Next: SendExecutionFailedNotification
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: !GetAtt PatchComplianceReportFunction.Arn
+              Payload:
+                instances.$: $.scanResult.Payload.instances
+                instance_details.$: $.scanResult.Payload.instance_details
+                patchGroup.$: $.statusResult.Payload.patchGroup
+            ResultPath: $.reportResult
+            Next: SendScanSuccessNotification
+          
+          SendScanSuccessNotification:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Resource: !GetAtt SendNotificationFunction.Arn
+            Parameters:
+              messageType: SUCCESS
+              subject: !Sub "${AWS::StackName} - Scan Completed Successfully"
+              message: "Patch scan has been successfully completed for all instances with the specified PatchGroup tag. Please check the report for details."
+              detail:
+                PatchGroup.$: $.detail.PatchGroup
+              instances.$: $.scanResult.Payload.instances
+              instance_details.$: $.scanResult.Payload.instance_details
+              statusResult.$: $.statusResult.Payload
+              reportUrl.$: $.reportResult.Payload.reportUrl
+              reportS3Uri.$: $.reportResult.Payload.reportS3Uri
+              scanResult.$: $.reportResult.Payload
+            ResultPath: $.finalNotificationResult
+            End: true
+          
+          SendScanFailureNotification:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Resource: !GetAtt SendNotificationFunction.Arn
+            Parameters:
+              messageType: ERROR
+              subject: !Sub "${AWS::StackName} - Scan Failed"
+              message: "Patch scan has failed for one or more instances with the specified PatchGroup tag. Please check the details for more information."
+              detail:
+                PatchGroup.$: $.detail.PatchGroup
+              instances.$: $.scanResult.Payload.instances
+              instance_details.$: $.scanResult.Payload.instance_details
+              statusResult.$: $.statusResult.Payload
+            ResultPath: $.finalNotificationResult
+            End: true
+          
+          # Generic catch-all failure notification. Only references fields that always
+          # exist on the input ($.detail.PatchGroup) plus the caught error ($.errorInfo),
+          # so it works no matter which task threw.
+          SendExecutionFailedNotification:
+            Type: Task
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                  - States.TaskFailed
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Resource: !GetAtt SendNotificationFunction.Arn
+            Parameters:
+              messageType: ERROR
+              subject: !Sub "${AWS::StackName} - Patching Workflow Error"
+              message: "The patching workflow stopped due to an unexpected error after automatic retries. Review the Step Function execution and CloudWatch logs for details."
+              detail:
+                PatchGroup.$: $.detail.PatchGroup
+              errorInfo.$: $.errorInfo
+            ResultPath: $.finalNotificationResult
+            End: true
+
+  # EventBridge Schedules (one per non-blank PatchGroup slot)
+  Schedule1:
+    Type: AWS::Scheduler::Schedule
+    Condition: CreateSchedule1
+    Properties:
+      Name: !Sub "${AWS::StackName}-${PatchGroup1}-schedule"
+      Description: !Sub "Patching schedule for PatchGroup ${PatchGroup1} (edit time, PatchMode, and State after creation)."
+      FlexibleTimeWindow:
+        Mode: "FLEXIBLE"
+        MaximumWindowInMinutes: 2
+      ScheduleExpression: "at(2090-09-09T05:09:00)" # placeholder - edit after creation
+      ScheduleExpressionTimezone: "Asia/Dubai"
+      State: DISABLED
+      Target:
+        Arn: !Ref PatchingStepFunction
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub '{"detail":{"PatchGroup":"${PatchGroup1}","PatchMode":"YOUR_PATCH_MODE_VALUE"}}'
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+  Schedule2:
+    Type: AWS::Scheduler::Schedule
+    Condition: CreateSchedule2
+    Properties:
+      Name: !Sub "${AWS::StackName}-${PatchGroup2}-schedule"
+      Description: !Sub "Patching schedule for PatchGroup ${PatchGroup2} (edit time, PatchMode, and State after creation)."
+      FlexibleTimeWindow:
+        Mode: "FLEXIBLE"
+        MaximumWindowInMinutes: 2
+      ScheduleExpression: "at(2090-09-09T05:09:00)" # placeholder - edit after creation
+      ScheduleExpressionTimezone: "Asia/Dubai"
+      State: DISABLED
+      Target:
+        Arn: !Ref PatchingStepFunction
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub '{"detail":{"PatchGroup":"${PatchGroup2}","PatchMode":"YOUR_PATCH_MODE_VALUE"}}'
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+  Schedule3:
+    Type: AWS::Scheduler::Schedule
+    Condition: CreateSchedule3
+    Properties:
+      Name: !Sub "${AWS::StackName}-${PatchGroup3}-schedule"
+      Description: !Sub "Patching schedule for PatchGroup ${PatchGroup3} (edit time, PatchMode, and State after creation)."
+      FlexibleTimeWindow:
+        Mode: "FLEXIBLE"
+        MaximumWindowInMinutes: 2
+      ScheduleExpression: "at(2090-09-09T05:09:00)" # placeholder - edit after creation
+      ScheduleExpressionTimezone: "Asia/Dubai"
+      State: DISABLED
+      Target:
+        Arn: !Ref PatchingStepFunction
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub '{"detail":{"PatchGroup":"${PatchGroup3}","PatchMode":"YOUR_PATCH_MODE_VALUE"}}'
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+  Schedule4:
+    Type: AWS::Scheduler::Schedule
+    Condition: CreateSchedule4
+    Properties:
+      Name: !Sub "${AWS::StackName}-${PatchGroup4}-schedule"
+      Description: !Sub "Patching schedule for PatchGroup ${PatchGroup4} (edit time, PatchMode, and State after creation)."
+      FlexibleTimeWindow:
+        Mode: "FLEXIBLE"
+        MaximumWindowInMinutes: 2
+      ScheduleExpression: "at(2090-09-09T05:09:00)" # placeholder - edit after creation
+      ScheduleExpressionTimezone: "Asia/Dubai"
+      State: DISABLED
+      Target:
+        Arn: !Ref PatchingStepFunction
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub '{"detail":{"PatchGroup":"${PatchGroup4}","PatchMode":"YOUR_PATCH_MODE_VALUE"}}'
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+  Schedule5:
+    Type: AWS::Scheduler::Schedule
+    Condition: CreateSchedule5
+    Properties:
+      Name: !Sub "${AWS::StackName}-${PatchGroup5}-schedule"
+      Description: !Sub "Patching schedule for PatchGroup ${PatchGroup5} (edit time, PatchMode, and State after creation)."
+      FlexibleTimeWindow:
+        Mode: "FLEXIBLE"
+        MaximumWindowInMinutes: 2
+      ScheduleExpression: "at(2090-09-09T05:09:00)" # placeholder - edit after creation
+      ScheduleExpressionTimezone: "Asia/Dubai"
+      State: DISABLED
+      Target:
+        Arn: !Ref PatchingStepFunction
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub '{"detail":{"PatchGroup":"${PatchGroup5}","PatchMode":"YOUR_PATCH_MODE_VALUE"}}'
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+
+Outputs:
+  StepFunctionArn:
+    Description: ARN of the Patching Step Function
+    Value: !Ref PatchingStepFunction
+  
+  SNSTopicArn:
+    Description: ARN of the Patching Alerts SNS Topic
+    Value: !Ref PatchingAlertsTopic
+  
+  S3BucketName:
+    Description: Name of the S3 bucket for patch compliance reports
+    Value: !Ref PatchComplianceReportsBucket
+  
+  ScheduleArn1:
+    Condition: CreateSchedule1
+    Description: "ARN of the schedule created for PatchGroup slot 1"
+    Value: !GetAtt Schedule1.Arn
+  
+  ScheduleArn2:
+    Condition: CreateSchedule2
+    Description: "ARN of the schedule created for PatchGroup slot 2"
+    Value: !GetAtt Schedule2.Arn
+  
+  ScheduleArn3:
+    Condition: CreateSchedule3
+    Description: "ARN of the schedule created for PatchGroup slot 3"
+    Value: !GetAtt Schedule3.Arn
+  
+  ScheduleArn4:
+    Condition: CreateSchedule4
+    Description: "ARN of the schedule created for PatchGroup slot 4"
+    Value: !GetAtt Schedule4.Arn
+  
+  ScheduleArn5:
+    Condition: CreateSchedule5
+    Description: "ARN of the schedule created for PatchGroup slot 5"
+    Value: !GetAtt Schedule5.Arn
+  
+  DirectInstallTriggerCommand:
+    Description: Command to directly trigger the Step Function in install mode
+    Value: !Sub |
+      aws stepfunctions start-execution --state-machine-arn ${PatchingStepFunction} --input '{"detail":{"PatchGroup":"YOUR_PATCH_GROUP_VALUE","PatchMode":"install"}}' --region ${AWS::Region}
+  
+  DirectScanTriggerCommand:
+    Description: Command to directly trigger the Step Function in scan mode
+    Value: !Sub |
+      aws stepfunctions start-execution --state-machine-arn ${PatchingStepFunction} --input '{"detail":{"PatchGroup":"YOUR_PATCH_GROUP_VALUE","PatchMode":"scan"}}' --region ${AWS::Region}
+  
+  ScheduleSetupNote:
+    Description: Required post-deployment step for the schedules
+    Value: "Each schedule is created DISABLED with a placeholder time (2090-09-09) and PatchMode=YOUR_PATCH_MODE_VALUE. After deployment, edit each schedule to set the real ScheduleExpression, set PatchMode to 'install' or 'scan', then set State to ENABLED."
+  
+  PatchModeNote:
+    Description: Note about PatchMode values
+    Value: "To use different patch modes, set PatchMode to 'install' for patching with reboot or 'scan' for scan-only with no reboot."
+  
+  DynamicPatchGroupNote:
+    Description: Note about adding PatchGroups
+    Value: "To add another PatchGroup, set the next blank PatchGroupN parameter and update the stack; a new schedule is created without affecting existing (already-edited) schedules."
